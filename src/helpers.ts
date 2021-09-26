@@ -413,6 +413,10 @@ export function addHelpers(
         print(
           `sending eth to create2 contract deployer address (${senderAddress})`
         );
+        
+        print(
+          `sending from address (${from})`
+        );
         if (hardwareWallet) {
           print(` (please confirm on your ${hardwareWallet})`);
         }
