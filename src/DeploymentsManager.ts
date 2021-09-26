@@ -14,10 +14,6 @@ import fs from 'fs-extra';
 import path from 'path';
 
 import {BigNumber} from '@ethersproject/bignumber';
-import {
-  parse as parseTransaction,
-  Transaction,
-} from '@ethersproject/transactions';
 
 import debug from 'debug';
 const log = debug('hardhat:wighawag:hardhat-deploy');
@@ -30,7 +26,8 @@ import {
   deleteDeployments,
   getExtendedArtifactFromFolder,
   getArtifactFromFolder,
-  recode,
+  getNetworkName,
+  getDeployPaths,
 } from './utils';
 import {addHelpers, waitForTx} from './helpers';
 import {TransactionResponse} from '@ethersproject/providers';
@@ -77,6 +74,36 @@ export class DeploymentsManager {
   private network: Network;
 
   private partialExtension: PartialExtension;
+
+  private utils: {
+    dealWithPendingTransactions: (
+      pendingTxs: {
+        [txHash: string]: {
+          name: string;
+          deployment?: any;
+          rawTx: string;
+          decoded: {
+            from: string;
+            gasPrice?: string;
+            maxFeePerGas?: string;
+            maxPriorityFeePerGas?: string;
+            gasLimit: string;
+            to: string;
+            value: string;
+            nonce: number;
+            data: string;
+            r: string;
+            s: string;
+            v: number;
+            // creates: tx.creates, // TODO test
+            chainId: number;
+          };
+        };
+      },
+      pendingTxPath: string,
+      globalGasPrice: string | undefined
+    ) => Promise<void>;
+  };
 
   constructor(env: HardhatRuntimeEnvironment, network: Network) {
     log('constructing DeploymentsManager');
@@ -151,13 +178,11 @@ export class DeploymentsManager {
           }
           return artifactFromFolder as Artifact;
         }
-        let artifact:
-          | Artifact
-          | ExtendedArtifact
-          | undefined = await getArtifactFromFolder(
-          contractName,
-          this.env.config.paths.artifacts
-        );
+        let artifact: Artifact | ExtendedArtifact | undefined =
+          await getArtifactFromFolder(
+            contractName,
+            this.env.config.paths.artifacts
+          );
         if (artifact) {
           return artifact as Artifact;
         }
@@ -189,12 +214,11 @@ export class DeploymentsManager {
           }
           return artifactFromFolder as ExtendedArtifact;
         }
-        let artifact:
-          | ExtendedArtifact
-          | undefined = await getExtendedArtifactFromFolder(
-          contractName,
-          this.env.config.paths.artifacts
-        );
+        let artifact: ExtendedArtifact | undefined =
+          await getExtendedArtifactFromFolder(
+            contractName,
+            this.env.config.paths.artifacts
+          );
         if (artifact) {
           return artifact;
         }
@@ -326,7 +350,7 @@ export class DeploymentsManager {
     };
 
     log('adding helpers');
-    this.deploymentsExtension = addHelpers(
+    const helpers = addHelpers(
       this,
       this.partialExtension,
       this.network,
@@ -342,9 +366,8 @@ export class DeploymentsManager {
           this.network.saveDeployments
         ) {
           // toSave (see deployments.save function)
-          const extendedArtifact = await this.partialExtension.getExtendedArtifact(
-            artifactName
-          );
+          const extendedArtifact =
+            await this.partialExtension.getExtendedArtifact(artifactName);
           deployment = {
             ...deployment,
             ...extendedArtifact,
@@ -367,6 +390,27 @@ export class DeploymentsManager {
       this.partialExtension.log,
       print
     );
+
+    this.deploymentsExtension = helpers.extension;
+    this.utils = helpers.utils;
+  }
+
+  private networkWasSetup = false;
+  public setupNetwork(): void {
+    if (this.networkWasSetup) {
+      return;
+    }
+    // reassign network variables based on fork name if any;
+    const networkName = this.getNetworkName();
+    if (networkName !== this.network.name) {
+      const networkObject = store.networks[networkName];
+      if (networkObject) {
+        this.env.network.live = networkObject.live;
+        this.env.network.tags = networkObject.tags;
+        this.env.network.deploy = networkObject.deploy;
+      }
+    }
+    this.networkWasSetup = true;
   }
 
   private _chainId: string | undefined;
@@ -374,6 +418,7 @@ export class DeploymentsManager {
     if (this._chainId) {
       return this._chainId;
     }
+    this.setupNetwork();
     try {
       this._chainId = await this.network.provider.send('eth_chainId');
     } catch (e) {
@@ -404,7 +449,9 @@ export class DeploymentsManager {
         rawTx: string;
         decoded: {
           from: string;
-          gasPrice: string;
+          gasPrice?: string;
+          maxFeePerGas?: string;
+          maxPriorityFeePerGas?: string;
           gasLimit: string;
           to: string;
           value: string;
@@ -426,51 +473,11 @@ export class DeploymentsManager {
     try {
       pendingTxs = JSON.parse(fs.readFileSync(pendingTxPath).toString());
     } catch (e) {}
-    const txHashes = Object.keys(pendingTxs);
-    for (const txHash of txHashes) {
-      const txData = pendingTxs[txHash];
-      if (txData.rawTx || txData.decoded) {
-        let tx: Transaction;
-        if (txData.rawTx) {
-          tx = parseTransaction(txData.rawTx);
-        } else {
-          tx = recode(txData.decoded);
-        }
-        if (this.db.gasPrice) {
-          if (tx.gasPrice.lt(this.db.gasPrice)) {
-            // TODO
-            console.log('TODO : resubmit tx with higher gas price');
-            console.log(tx);
-          }
-        }
-        // alternative add options to deploy task to delete pending tx, combined with --gasprice this would work (except for timing edge case)
-      } else {
-        console.error(`no access to raw data for tx ${txHash}`);
-      }
-      if (this.db.logEnabled) {
-        console.log(
-          `waiting for tx ${txHash}` +
-            (txData.name ? ` for ${txData.name} Deployment` : '')
-        );
-      }
-      const receipt = await waitForTx(this.network.provider, txHash, false);
-      if (
-        (!receipt.status || receipt.status == 1) && // ensure we do not save failed deployment
-        receipt.contractAddress &&
-        txData.name
-      ) {
-        await this.saveDeployment(txData.name, {
-          ...txData.deployment,
-          receipt,
-        });
-      }
-      delete pendingTxs[txHash];
-      if (Object.keys(pendingTxs).length === 0) {
-        fs.removeSync(pendingTxPath);
-      } else {
-        fs.writeFileSync(pendingTxPath, JSON.stringify(pendingTxs, null, '  '));
-      }
-    }
+    await this.utils.dealWithPendingTransactions(
+      pendingTxs,
+      pendingTxPath,
+      this.db.gasPrice
+    );
   }
 
   // eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
@@ -497,7 +504,9 @@ export class DeploymentsManager {
         ? undefined
         : {
             from: tx.from,
-            gasPrice: tx.gasPrice.toString(),
+            gasPrice: tx.gasPrice?.toString(),
+            maxFeePerGas: tx.maxFeePerGas?.toString(),
+            maxPriorityFeePerGas: tx.maxPriorityFeePerGas?.toString(),
             gasLimit: tx.gasLimit.toString(),
             to: tx.to,
             value: tx.value.toString(),
@@ -571,13 +580,16 @@ export class DeploymentsManager {
     } catch (e) {}
     this.db.migrations = migrations;
     // console.log({ migrations: this.db.migrations });
+
+    const networkName = this.getDeploymentNetworkName();
+
     addDeployments(
       this.db,
       this.deploymentsPath,
       this.deploymentFolder(),
-      chainId
+      networkName === this.network.name ? chainId : undefined // fork mode, we do not care about chainId ?
     );
-    const networkName = this.network.name;
+
     const extraDeploymentPaths =
       this.env.config.external &&
       this.env.config.external.deployments &&
@@ -761,7 +773,7 @@ export class DeploymentsManager {
 
       fs.writeFileSync(filepath, JSON.stringify(obj, null, '  '));
 
-      if (deployment.solcInputHash) {
+      if (deployment.solcInputHash && deployment.solcInput) {
         const solcInputsFolderpath = path.join(
           this.deploymentsPath,
           this.deploymentFolder(),
@@ -785,6 +797,14 @@ export class DeploymentsManager {
     return true;
   }
 
+  private companionManagers: {[name: string]: DeploymentsManager} = {};
+  public addCompanionManager(
+    name: string,
+    networkDeploymentsManager: DeploymentsManager
+  ): void {
+    this.companionManagers[name] = networkDeploymentsManager;
+  }
+
   public async runDeploy(
     tags?: string | string[],
     options: {
@@ -805,11 +825,16 @@ export class DeploymentsManager {
     }
   ): Promise<{[name: string]: Deployment}> {
     log('runDeploy');
+    this.setupNetwork();
     if (options.deletePreviousDeployments) {
       log('deleting previous deployments');
       this.db.deployments = {};
       this.db.migrations = {};
       await this.deletePreviousDeployments();
+      for (const companionNetworkName of Object.keys(this.companionManagers)) {
+        const companionManager = this.companionManagers[companionNetworkName];
+        companionManager.deletePreviousDeployments();
+      }
     }
 
     await this.loadDeployments();
@@ -826,16 +851,21 @@ export class DeploymentsManager {
       await this.dealWithPendingTransactions(); // TODO deal with reset ?
     }
 
-    if (this.env.config.external?.contracts) {
-      for (const externalContracts of this.env.config.external.contracts) {
-        if (externalContracts.deploy) {
-          this.db.onlyArtifacts = externalContracts.artifacts;
-          try {
-            await this.executeDeployScripts([externalContracts.deploy]);
-          } finally {
-            this.db.onlyArtifacts = undefined;
-          }
-        }
+    for (const companionNetworkName of Object.keys(this.companionManagers)) {
+      const companionManager = this.companionManagers[companionNetworkName];
+      await companionManager.loadDeployments();
+      companionManager.db.writeDeploymentsToFiles =
+        options.writeDeploymentsToFiles;
+      companionManager.db.savePendingTx = options.savePendingTx;
+      companionManager.db.logEnabled = options.log;
+      // companionManager.db.gasPrice = options.gasPrice;
+      if (options.resetMemory) {
+        log('reseting memory');
+        companionManager.db.deployments = {};
+        companionManager.db.migrations = {};
+      }
+      if (!options.deletePreviousDeployments && options.savePendingTx) {
+        await companionManager.dealWithPendingTransactions(); // TODO deal with reset ?
       }
     }
 
@@ -843,8 +873,20 @@ export class DeploymentsManager {
       tags = [tags];
     }
 
-    const deployPaths =
-      this.network.deploy || store.networkDeployPaths[this.network.name]; // fallback to global store
+    if (this.env.config.external?.contracts) {
+      for (const externalContracts of this.env.config.external.contracts) {
+        if (externalContracts.deploy) {
+          this.db.onlyArtifacts = externalContracts.artifacts;
+          try {
+            await this.executeDeployScripts([externalContracts.deploy], tags);
+          } finally {
+            this.db.onlyArtifacts = undefined;
+          }
+        }
+      }
+    }
+
+    const deployPaths = getDeployPaths(this.network);
 
     await this.executeDeployScripts(deployPaths, tags);
 
@@ -858,6 +900,8 @@ export class DeploymentsManager {
     tags?: string[]
   ): Promise<void> {
     const wasWrittingToFiles = this.db.writeDeploymentsToFiles;
+    // TODO loop over companion networks ?
+    // This is currently posing problem for network like optimism which require a different set of artifact and hardhat currently only expose one set at a time
 
     let filepaths;
     try {
@@ -1107,10 +1151,10 @@ export class DeploymentsManager {
         all[chainId] = {};
       } else {
         // Ensure no past deployments are recorded
-        delete all[chainId][this.network.name];
+        delete all[chainId][this.getDeploymentNetworkName()];
       }
-      all[chainId][this.network.name] = {
-        name: this.network.name,
+      all[chainId][this.getDeploymentNetworkName()] = {
+        name: this.getDeploymentNetworkName(),
         chainId,
         contracts: currentNetworkDeployments,
       };
@@ -1141,7 +1185,7 @@ export class DeploymentsManager {
         throw new Error('chainId is undefined');
       }
       const singleExport: Export = {
-        name: this.network.name,
+        name: this.getDeploymentNetworkName(),
         chainId,
         contracts: currentNetworkDeployments,
       };
@@ -1164,6 +1208,7 @@ export class DeploymentsManager {
   }
 
   private async setup(isRunningGlobalFixture: boolean) {
+    this.setupNetwork();
     if (!this.db.deploymentsLoaded && !isRunningGlobalFixture) {
       if (process.env.HARDHAT_DEPLOY_FIXTURE) {
         if (process.env.HARDHAT_COMPILE) {
@@ -1236,12 +1281,19 @@ export class DeploymentsManager {
     this.impersonateUnknownAccounts = false;
   }
 
-  private deploymentFolder(): string {
+  private getNetworkName(): string {
+    return getNetworkName(this.network);
+  }
+
+  private getDeploymentNetworkName(): string {
     if (this.db.runAsNode) {
       return 'localhost';
-    } else {
-      return this.network.name;
     }
+    return getNetworkName(this.network);
+  }
+
+  private deploymentFolder(): string {
+    return this.getDeploymentNetworkName();
   }
 
   private async setupAccounts(): Promise<{

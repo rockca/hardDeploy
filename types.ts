@@ -83,10 +83,9 @@ export interface DiamondOptions extends TxOptions {
   deterministicSalt?: string;
 }
 
-export interface ProxyOptions {
+type ProxyOptionsBase = {
   owner?: Address;
   upgradeIndex?: number;
-  methodName?: string;
   proxyContract?: // default to EIP173Proxy
   string | ArtifactData;
   viaAdminContract?:
@@ -95,7 +94,29 @@ export interface ProxyOptions {
         name: string;
         artifact?: string | ArtifactData;
       };
-}
+};
+
+export type ProxyOptions =
+  | (ProxyOptionsBase & {
+      methodName?: string;
+    })
+  | (ProxyOptionsBase & {
+      execute?:
+        | {
+            methodName: string;
+            args: any[];
+          }
+        | {
+            init: {
+              methodName: string;
+              args: any[];
+            };
+            onUpgrade?: {
+              methodName: string;
+              args: any[];
+            };
+          };
+    });
 
 export type ArtifactData = {
   abi: ABI;
@@ -112,7 +133,6 @@ export type ArtifactData = {
 export interface DeployOptionsBase extends TxOptions {
   contract?: string | ArtifactData;
   args?: any[];
-  fieldsToCompare?: string | string[];
   skipIfAlreadyDeployed?: boolean;
   linkedData?: any; // JSONable ?
   libraries?: Libraries;
@@ -131,6 +151,8 @@ export interface CallOptions {
   from?: string;
   gasLimit?: string | number | BigNumber;
   gasPrice?: string | BigNumber;
+  maxFeePerGas?: string | BigNumber;
+  maxPriorityFeePerGas?: string | BigNumber;
   value?: string | BigNumber;
   nonce?: string | number | BigNumber;
   to?: string; // TODO make to and data part of a `SimpleCallOptions` interface

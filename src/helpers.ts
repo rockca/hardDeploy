@@ -1,6 +1,10 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import {Signer} from '@ethersproject/abstract-signer';
-import {Web3Provider, TransactionResponse} from '@ethersproject/providers';
+import {
+  Web3Provider,
+  TransactionResponse,
+  TransactionRequest,
+} from '@ethersproject/providers';
 import {getAddress} from '@ethersproject/address';
 import {
   Contract,
@@ -34,7 +38,8 @@ import {
 } from '../types';
 import {PartialExtension} from './internal/types';
 import {UnknownSignerError} from './errors';
-import {mergeABIs} from './utils';
+import {mergeABIs, recode} from './utils';
+import fs from 'fs-extra';
 
 import OpenZeppelinTransparentProxy from '../extendedArtifacts/TransparentUpgradeableProxy.json';
 import OptimizedTransparentUpgradeableProxy from '../extendedArtifacts/OptimizedTransparentUpgradeableProxy.json';
@@ -48,6 +53,11 @@ import ownershipFacet from '../extendedArtifacts/OwnershipFacet.json';
 import diamantaire from '../extendedArtifacts/Diamantaire.json';
 import {Artifact, EthereumProvider, Network} from 'hardhat/types';
 import {DeploymentsManager} from './DeploymentsManager';
+import enquirer from 'enquirer';
+import {
+  parse as parseTransaction,
+  Transaction,
+} from '@ethersproject/transactions';
 
 let LedgerSigner: any; // TODO type
 
@@ -60,6 +70,48 @@ diamondBase.abi = mergeABIs(
   ],
   {check: false, skipSupportsInterface: false}
 );
+
+async function handleSpecificErrors<T>(p: Promise<T>): Promise<T> {
+  let result: T;
+  try {
+    result = await p;
+  } catch (e) {
+    if (
+      typeof e.message === 'string' &&
+      e.message.indexOf('already known') !== -1
+    ) {
+      console.log(
+        `
+Exact same transaction already in the pool, node reject duplicates.
+You'll need to wait the tx resolve, or increase the gas price via --gasprice (this will use old tx type)
+        `
+      );
+      throw new Error(
+        'Exact same transaction already in the pool, node reject duplicates'
+      );
+      // console.log(
+      //   `\nExact same transaction already in the pool, node reject duplicates, waiting for it instead...\n`
+      // );
+      // const signedTx = await ethersSigner.signTransaction(unsignedTx);
+      // const decoded = parseTransaction(signedTx);
+      // if (!decoded.hash) {
+      //   throw new Error(
+      //     'tx with same hash already in the pool, failed to decode to get the hash'
+      //   );
+      // }
+      // const txHash = decoded.hash;
+      // tx = Object.assign(decoded as TransactionResponse, {
+      //   wait: (confirmations: number) =>
+      //     provider.waitForTransaction(txHash, confirmations),
+      //   confirmations: 0,
+      // });
+    } else {
+      console.error(e.message, JSON.stringify(e), e);
+      throw e;
+    }
+  }
+  return result;
+}
 
 function fixProvider(providerGiven: any): any {
   // alow it to be used by ethers without any change
@@ -190,11 +242,42 @@ export function addHelpers(
   getGasPrice: () => Promise<BigNumber | undefined>,
   log: (...args: any[]) => void,
   print: (msg: string) => void
-): DeploymentsExtension {
+): {
+  extension: DeploymentsExtension;
+  utils: {
+    dealWithPendingTransactions: (
+      pendingTxs: {
+        [txHash: string]: {
+          name: string;
+          deployment?: any;
+          rawTx: string;
+          decoded: {
+            from: string;
+            gasPrice?: string;
+            maxFeePerGas?: string;
+            maxPriorityFeePerGas?: string;
+            gasLimit: string;
+            to: string;
+            value: string;
+            nonce: number;
+            data: string;
+            r: string;
+            s: string;
+            v: number;
+            // creates: tx.creates, // TODO test
+            chainId: number;
+          };
+        };
+      },
+      pendingTxPath: string,
+      globalGasPrice: string | undefined
+    ) => Promise<void>;
+  };
+} {
   let provider: Web3Provider;
   const availableAccounts: {[name: string]: boolean} = {};
 
-  async function init() {
+  async function init(): Promise<Web3Provider> {
     if (!provider) {
       provider = new Web3Provider(fixProvider(network.provider));
       try {
@@ -208,21 +291,46 @@ export function addHelpers(
         }
       } catch (e) {}
     }
+    return provider;
   }
 
-  async function setupGasPrice(overrides: any) {
-    if (!overrides.gasPrice) {
-      overrides.gasPrice = await getGasPrice();
+  async function setupGasPrice(
+    txRequestOrOverrides: TransactionRequest | PayableOverrides
+  ) {
+    if (!txRequestOrOverrides.gasPrice) {
+      txRequestOrOverrides.gasPrice = await getGasPrice();
+    }
+  }
+
+  async function setupNonce(
+    from: string,
+    txRequestOrOverrides: TransactionRequest | PayableOverrides
+  ) {
+    if (
+      txRequestOrOverrides.nonce === 'pending' ||
+      txRequestOrOverrides.nonce === 'latest'
+    ) {
+      txRequestOrOverrides.nonce = await provider.getTransactionCount(
+        from,
+        txRequestOrOverrides.nonce
+      );
+    } else if (!txRequestOrOverrides.nonce) {
+      txRequestOrOverrides.nonce = await provider.getTransactionCount(
+        from,
+        'latest'
+      );
     }
   }
 
   async function overrideGasLimit(
-    overrides: any,
+    txRequestOrOverrides: TransactionRequest | PayableOverrides,
     options: {
       estimatedGasLimit?: number | BigNumber | string;
       estimateGasExtra?: number | BigNumber | string;
     },
-    estimate: (overrides: any) => Promise<BigNumber>
+    estimate: (
+      txRequestOrOverrides: TransactionRequest | PayableOverrides
+    ) => Promise<BigNumber>
   ) {
     const estimatedGasLimit = options.estimatedGasLimit
       ? BigNumber.from(options.estimatedGasLimit).toNumber()
@@ -230,13 +338,19 @@ export function addHelpers(
     const estimateGasExtra = options.estimateGasExtra
       ? BigNumber.from(options.estimateGasExtra).toNumber()
       : undefined;
-    if (!overrides.gasLimit) {
-      overrides.gasLimit = estimatedGasLimit;
-      overrides.gasLimit = (await estimate(overrides)).toNumber();
+    if (!txRequestOrOverrides.gasLimit) {
+      txRequestOrOverrides.gasLimit = estimatedGasLimit;
+      txRequestOrOverrides.gasLimit = (
+        await estimate(txRequestOrOverrides)
+      ).toNumber();
       if (estimateGasExtra) {
-        overrides.gasLimit = overrides.gasLimit + estimateGasExtra;
+        txRequestOrOverrides.gasLimit =
+          txRequestOrOverrides.gasLimit + estimateGasExtra;
         if (estimatedGasLimit) {
-          overrides.gasLimit = Math.min(overrides.gasLimit, estimatedGasLimit);
+          txRequestOrOverrides.gasLimit = Math.min(
+            txRequestOrOverrides.gasLimit,
+            estimatedGasLimit
+          );
         }
       }
     }
@@ -263,41 +377,56 @@ export function addHelpers(
   async function ensureCreate2DeployerReady(options: {
     from: string;
     log?: boolean;
+    gasPrice?: string | BigNumber;
+    maxFeePerGas?: string | BigNumber;
+    maxPriorityFeePerGas?: string | BigNumber;
   }): Promise<string> {
-    const {address: from, ethersSigner, hardwareWallet} = getFrom(options.from);
-    if (!ethersSigner) {
-      throw new Error('no signer for ' + from);
-    }
+    const {
+      address: from,
+      ethersSigner,
+      hardwareWallet,
+      unknown,
+    } = getFrom(options.from);
     const create2DeployerAddress = '0x4e59b44847b379578588920ca78fbf26c0b4956c';
     const code = await provider.getCode(create2DeployerAddress);
     if (code === '0x') {
       const senderAddress = '0x3fab184622dc19b6109349b94811493bf2a45362';
-      // TODO gasPrice override
+
+      const txRequest = {
+        to: senderAddress,
+        value: BigNumber.from('10000000000000000').toHexString(),
+        gasPrice: options.gasPrice,
+        maxFeePerGas: options.maxFeePerGas,
+        maxPriorityFeePerGas: options.maxPriorityFeePerGas,
+      };
+      await setupGasPrice(txRequest);
+      await setupNonce(from, txRequest);
+
+      if (unknown) {
+        throw new UnknownSignerError({
+          from,
+          ...txRequest,
+        });
+      }
 
       if (options.log || hardwareWallet) {
         print(
           `sending eth to create2 contract deployer address (${senderAddress})`
         );
-        
-        print(
-          `sending from address (${from})`
-        );
         if (hardwareWallet) {
           print(` (please confirm on your ${hardwareWallet})`);
         }
       }
-      const ethTx = await ethersSigner.sendTransaction({
-        to: senderAddress,
-        value: BigNumber.from('10000000000000000').toHexString(),
-      });
+
+      let ethTx = await handleSpecificErrors(
+        ethersSigner.sendTransaction(txRequest)
+      );
       if (options.log || hardwareWallet) {
         log(` (tx: ${ethTx.hash})...`);
       }
+      ethTx = await onPendingTx(ethTx);
       await ethTx.wait();
 
-      // await provider.send("eth_sendTransaction", [{
-      //   from
-      // }]);
       if (options.log || hardwareWallet) {
         print(
           `deploying create2 deployer contract (at ${create2DeployerAddress}) using deterministic deployment (https://github.com/Arachnid/deterministic-deployment-proxy)`
@@ -359,10 +488,12 @@ export function addHelpers(
   ): Promise<DeployResult> {
     const args: any[] = options.args ? [...options.args] : [];
     await init();
-    const {address: from, ethersSigner, hardwareWallet} = getFrom(options.from);
-    if (!ethersSigner) {
-      throw new Error('no signer for ' + from);
-    }
+    const {
+      address: from,
+      ethersSigner,
+      hardwareWallet,
+      unknown,
+    } = getFrom(options.from);
 
     const {artifact: linkedArtifact, artifactName} = await getLinkedArtifact(
       name,
@@ -372,6 +503,8 @@ export function addHelpers(
     const overrides: PayableOverrides = {
       gasLimit: options.gasLimit,
       gasPrice: options.gasPrice,
+      maxFeePerGas: options.maxFeePerGas,
+      maxPriorityFeePerGas: options.maxPriorityFeePerGas,
       value: options.value,
       nonce: options.nonce,
     };
@@ -416,6 +549,14 @@ export function addHelpers(
       ethersSigner.estimateGas(newOverrides)
     );
     await setupGasPrice(unsignedTx);
+    await setupNonce(from, unsignedTx);
+
+    if (unknown) {
+      throw new UnknownSignerError({
+        from,
+        ...JSON.parse(JSON.stringify(unsignedTx)),
+      });
+    }
 
     if (options.log || hardwareWallet) {
       print(`deploying "${name}"`);
@@ -423,19 +564,13 @@ export function addHelpers(
         print(` (please confirm on your ${hardwareWallet})`);
       }
     }
-    let tx = await ethersSigner.sendTransaction(unsignedTx);
+    let tx = await handleSpecificErrors(
+      ethersSigner.sendTransaction(unsignedTx)
+    );
 
     if (options.log || hardwareWallet) {
       print(` (tx: ${tx.hash})...`);
     }
-
-    // await overrideGasLimit(overrides, options, newOverrides =>
-    //   ethersSigner.estimateGas(newOverrides)
-    // );
-    // await setupGasPrice(overrides);
-    // console.log({ args, overrides });
-    // const ethersContract = await factory.deploy(...args, overrides);
-    // let tx = ethersContract.deployTransaction;
 
     if (options.autoMine) {
       try {
@@ -495,10 +630,8 @@ export function addHelpers(
     // TODO refactor to share that code:
     const args: any[] = options.args ? [...options.args] : [];
     await init();
-    const {address: from, ethersSigner} = getFrom(options.from);
-    if (!ethersSigner) {
-      throw new Error('no signer for ' + from);
-    }
+    const {ethersSigner, unknown, address: from} = getFrom(options.from);
+
     const artifactInfo = await getArtifactFromOptions(name, options);
     const {artifact} = artifactInfo;
     const abi = artifact.abi;
@@ -512,14 +645,14 @@ export function addHelpers(
       );
     }
 
-    const overrides: PayableOverrides = {
-      gasLimit: options.gasLimit,
-      gasPrice: options.gasPrice,
-      value: options.value,
-      nonce: options.nonce,
-    };
+    const unsignedTx = factory.getDeployTransaction(...args);
 
-    const unsignedTx = factory.getDeployTransaction(...args, overrides);
+    if (unknown) {
+      throw new UnknownSignerError({
+        from,
+        ...JSON.parse(JSON.stringify(unsignedTx)),
+      });
+    }
 
     if (typeof unsignedTx.data !== 'string') {
       throw new Error('unsigned tx data as bytes not supported');
@@ -558,11 +691,8 @@ export function addHelpers(
     await init();
 
     if (options.deterministicDeployment) {
-      // TODO remove duplication:
-      const {address: from, ethersSigner} = getFrom(options.from);
-      if (!ethersSigner) {
-        throw new Error('no signer for ' + from);
-      }
+      const {ethersSigner} = getFrom(options.from);
+
       const artifactInfo = await getArtifactFromOptions(name, options);
       const {artifact} = artifactInfo;
       const abi = artifact.abi;
@@ -576,14 +706,7 @@ export function addHelpers(
         );
       }
 
-      const overrides: PayableOverrides = {
-        gasLimit: options.gasLimit,
-        gasPrice: options.gasPrice,
-        value: options.value,
-        nonce: options.nonce,
-      };
-
-      const unsignedTx = factory.getDeployTransaction(...argArray, overrides);
+      const unsignedTx = factory.getDeployTransaction(...argArray);
       if (typeof unsignedTx.data === 'string') {
         const create2Salt =
           typeof options.deterministicDeployment === 'string'
@@ -606,10 +729,6 @@ export function addHelpers(
         throw new Error('unsigned tx data as bytes not supported');
       }
     }
-    const fieldsToCompareArray =
-      typeof options.fieldsToCompare === 'string'
-        ? [options.fieldsToCompare]
-        : options.fieldsToCompare || [];
     const deployment = await partialExtension.getOrNull(name);
     if (deployment) {
       if (options.skipIfAlreadyDeployed) {
@@ -626,38 +745,16 @@ export function addHelpers(
       }
 
       if (transaction) {
-        const {ethersSigner} = await getOptionalFrom(options.from);
+        const {ethersSigner} = await getFrom(options.from);
         const {artifact} = await getArtifactFromOptions(name, options);
         const abi = artifact.abi;
         const byteCode = linkLibraries(artifact, options.libraries);
         const factory = new ContractFactory(abi, byteCode, ethersSigner);
+        const newTransaction = factory.getDeployTransaction(...argArray);
+        const newData = newTransaction.data?.toString();
 
-        const compareOnData = fieldsToCompareArray.indexOf('data') !== -1;
-
-        let data;
-        if (compareOnData) {
-          const deployStruct = factory.getDeployTransaction(...argArray);
-          data = deployStruct.data;
-        }
-        const newTransaction = {
-          data: compareOnData ? data : undefined,
-          gasLimit: options.gasLimit,
-          gasPrice: options.gasPrice,
-          value: options.value,
-          from: options.from,
-        };
-
-        for (const field of fieldsToCompareArray) {
-          if (typeof (newTransaction as any)[field] === 'undefined') {
-            throw new Error(
-              'field ' +
-                field +
-                ' not specified in new transaction, cant compare'
-            );
-          }
-          if ((transaction as any)[field] !== (newTransaction as any)[field]) {
-            return {differences: true, address: deployment.address};
-          }
+        if (transaction.data !== newData) {
+          return {differences: true, address: deployment.address};
         }
         return {differences: false, address: deployment.address};
       }
@@ -672,61 +769,26 @@ export function addHelpers(
   ): Promise<DeployResult> {
     const argsArray = options.args ? [...options.args] : [];
     options = {...options, args: argsArray};
-    if (options.fieldsToCompare === undefined) {
-      options.fieldsToCompare = ['data'];
-    }
+
     let result: DeployResult;
-    if (options.fieldsToCompare) {
-      const diffResult = await fetchIfDifferent(name, options);
-      if (diffResult.differences) {
-        result = await _deploy(name, options);
-      } else {
-        if (failsOnExistingDeterminisitc && options.deterministicDeployment) {
-          throw new Error(
-            `already deployed on same deterministic address: ${diffResult.address}`
-          );
-        }
-        const deployment = await getDeploymentOrNUll(name);
-        if (deployment) {
-          if (
-            options.deterministicDeployment &&
-            diffResult.address &&
-            diffResult.address.toLowerCase() !==
-              deployment.address.toLowerCase()
-          ) {
-            const {
-              artifact: linkedArtifact,
-              artifactName,
-            } = await getLinkedArtifact(name, options);
-
-            // receipt missing
-            const newDeployment = {
-              ...linkedArtifact,
-              address: diffResult.address,
-              linkedData: options.linkedData,
-              libraries: options.libraries,
-              args: argsArray,
-            };
-            await saveDeployment(name, newDeployment, artifactName);
-            result = {
-              ...newDeployment,
-              newlyDeployed: false,
-            };
-          } else {
-            result = deployment as DeployResult;
-            result.newlyDeployed = false;
-          }
-        } else {
-          if (!diffResult.address) {
-            throw new Error(
-              'no differences found but no address, this should be impossible'
-            );
-          }
-
-          const {
-            artifact: linkedArtifact,
-            artifactName,
-          } = await getLinkedArtifact(name, options);
+    const diffResult = await fetchIfDifferent(name, options);
+    if (diffResult.differences) {
+      result = await _deploy(name, options);
+    } else {
+      if (failsOnExistingDeterminisitc && options.deterministicDeployment) {
+        throw new Error(
+          `already deployed on same deterministic address: ${diffResult.address}`
+        );
+      }
+      const deployment = await getDeploymentOrNUll(name);
+      if (deployment) {
+        if (
+          options.deterministicDeployment &&
+          diffResult.address &&
+          diffResult.address.toLowerCase() !== deployment.address.toLowerCase()
+        ) {
+          const {artifact: linkedArtifact, artifactName} =
+            await getLinkedArtifact(name, options);
 
           // receipt missing
           const newDeployment = {
@@ -741,14 +803,39 @@ export function addHelpers(
             ...newDeployment,
             newlyDeployed: false,
           };
+        } else {
+          result = deployment as DeployResult;
+          result.newlyDeployed = false;
         }
-        if (options.log) {
-          log(`reusing "${name}" at ${result.address}`);
+      } else {
+        if (!diffResult.address) {
+          throw new Error(
+            'no differences found but no address, this should be impossible'
+          );
         }
+
+        const {artifact: linkedArtifact, artifactName} =
+          await getLinkedArtifact(name, options);
+
+        // receipt missing
+        const newDeployment = {
+          ...linkedArtifact,
+          address: diffResult.address,
+          linkedData: options.linkedData,
+          libraries: options.libraries,
+          args: argsArray,
+        };
+        await saveDeployment(name, newDeployment, artifactName);
+        result = {
+          ...newDeployment,
+          newlyDeployed: false,
+        };
       }
-    } else {
-      result = await _deploy(name, options);
+      if (options.log) {
+        log(`reusing "${name}" at ${result.address}`);
+      }
     }
+
     return result;
   }
 
@@ -801,6 +888,7 @@ export function addHelpers(
   ): Promise<DeployResult> {
     const oldDeployment = await getDeploymentOrNUll(name);
     let updateMethod: string | undefined;
+    let updateArgs: any[] | undefined;
     let upgradeIndex;
     let proxyContract: ExtendedArtifact = eip173Proxy;
     let checkABIConflict = true;
@@ -810,7 +898,40 @@ export function addHelpers(
       | undefined;
     if (typeof options.proxy === 'object') {
       upgradeIndex = options.proxy.upgradeIndex;
-      updateMethod = options.proxy.methodName;
+      if ('methodName' in options.proxy) {
+        updateMethod = options.proxy.methodName;
+        if ('execute' in options.proxy) {
+          throw new Error(
+            `cannot have both "methodName" and "execute" options for proxy`
+          );
+        }
+      } else if ('execute' in options.proxy && options.proxy.execute) {
+        if ('methodName' in options.proxy.execute) {
+          updateMethod = options.proxy.execute.methodName;
+          updateArgs = options.proxy.execute.args;
+          if (
+            'init' in options.proxy.execute ||
+            'onUpgrade' in options.proxy.execute
+          ) {
+            throw new Error(
+              `cannot have both "methodName" and ("onUpgrade" or "init") options for proxy.execute`
+            );
+          }
+        } else if (
+          ('init' in options.proxy.execute && options.proxy.execute.init) ||
+          ('onUpgrade' in options.proxy.execute &&
+            options.proxy.execute.onUpgrade)
+        ) {
+          if (oldDeployment) {
+            updateMethod = options.proxy.execute.onUpgrade?.methodName;
+            updateArgs = options.proxy.execute.onUpgrade?.args;
+          } else {
+            updateMethod = options.proxy.execute.init.methodName;
+            updateArgs = options.proxy.execute.init.args;
+          }
+        }
+      }
+
       if (options.proxy.proxyContract) {
         if (typeof options.proxy.proxyContract === 'string') {
           try {
@@ -856,7 +977,7 @@ export function addHelpers(
     const proxyName = name + '_Proxy';
     const {address: owner} = getProxyOwner(options);
     const {address: from} = getFrom(options.from);
-    const argsArray = options.args ? [...options.args] : [];
+    const implementationArgs = options.args ? [...options.args] : [];
 
     // --- Implementation Deployment ---
     const implementationName = name + '_Implementation';
@@ -867,16 +988,17 @@ export function addHelpers(
       estimateGasExtra: options.estimateGasExtra,
       estimatedGasLimit: options.estimatedGasLimit,
       gasPrice: options.gasPrice,
+      maxFeePerGas: options.maxFeePerGas,
+      maxPriorityFeePerGas: options.maxPriorityFeePerGas,
       log: options.log,
       deterministicDeployment: options.deterministicDeployment,
       libraries: options.libraries,
-      fieldsToCompare: options.fieldsToCompare,
       linkedData: options.linkedData,
-      args: options.args,
+      args: implementationArgs,
     };
 
     const {artifact} = await getArtifactFromOptions(
-      implementationName,
+      name,
       implementationOptions
     );
 
@@ -894,27 +1016,51 @@ export function addHelpers(
       (fragment: {type: string; inputs: any[]}) =>
         fragment.type === 'constructor'
     );
-    if (!constructor || constructor.inputs.length !== argsArray.length) {
-      delete implementationOptions.args;
-      if (constructor && constructor.inputs.length > 0) {
-        throw new Error(
-          `Proxy based contract constructor can only have either zero argument or the exact same argument as the method used for postUpgrade actions ${
-            updateMethod ? '(' + updateMethod + '}' : ''
-          }.
-Plus they are only used when the contract is meant to be used as standalone when development ends.
-`
-        );
-      }
+
+    if (
+      (!constructor && implementationArgs.length > 0) ||
+      (constructor && constructor.inputs.length !== implementationArgs.length)
+    ) {
+      throw new Error(
+        `The number of arguments passed to not match the number of argument in the implementation constructor.
+Please specify the correct number of arguments as part of the deploy options: "args"`
+      );
     }
 
     if (updateMethod) {
-      const updateMethodFound = artifact.abi.find(
+      const updateMethodFound: {
+        type: string;
+        inputs: any[];
+        name: string;
+      } = artifact.abi.find(
         (fragment: {type: string; inputs: any[]; name: string}) =>
           fragment.type === 'function' && fragment.name === updateMethod
       );
       if (!updateMethodFound) {
         throw new Error(`contract need to implement function ${updateMethod}`);
       }
+
+      if (!updateArgs) {
+        if (implementationArgs.length === updateMethodFound.inputs.length) {
+          updateArgs = implementationArgs;
+        } else {
+          throw new Error(
+            `
+If only the methodName (and no args) is specified for proxy deployment, the arguments used for the implementation contract will be reused for the update method.
+This allow your contract to both be deployed directly and deployed via proxy.
+
+Currently your contract implementation's constructor do not have the same number of arguments as the update method.
+You can either changes the contract or use the "execute" options and specify different arguments for the update method.
+Note that in this case, the contract deployment will not behave the same if deployed without proxy.
+    `
+          );
+        }
+      }
+    }
+
+    // this avoid typescript error, but should not be necessary at runtime
+    if (!updateArgs) {
+      updateArgs = implementationArgs;
     }
 
     let proxyAdminName: string | undefined;
@@ -962,10 +1108,13 @@ Plus they are only used when the contract is meant to be used as standalone when
           estimateGasExtra: options.estimateGasExtra,
           estimatedGasLimit: options.estimatedGasLimit,
           gasPrice: options.gasPrice,
+          maxFeePerGas: options.maxFeePerGas,
+          maxPriorityFeePerGas: options.maxPriorityFeePerGas,
           log: options.log,
           contract: proxyAdminContract,
+          deterministicDeployment: options.deterministicDeployment,
           skipIfAlreadyDeployed: true,
-          args: [owner], // TODO change ProxyAdmin implementation
+          args: [owner],
         });
       }
 
@@ -1005,7 +1154,7 @@ Plus they are only used when the contract is meant to be used as standalone when
         }
         const txData = await implementationContract.populateTransaction[
           updateMethod
-        ](...argsArray);
+        ](...updateArgs);
         data = txData.data || '0x';
       }
 
@@ -1022,9 +1171,7 @@ Plus they are only used when the contract is meant to be used as standalone when
           proxy.address,
           '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
         );
-        const currentOwner = getAddress(
-          BigNumber.from(ownerStorage).toHexString()
-        );
+        const currentOwner = getAddress(`0x${ownerStorage.substr(-40)}`);
 
         const oldProxy = proxy.abi.find(
           (frag: {name: string}) => frag.name === 'changeImplementation'
@@ -1052,10 +1199,6 @@ Plus they are only used when the contract is meant to be used as standalone when
             throw new Error(`no currentProxyAdminOwner found in ProxyAdmin`);
           }
 
-          if (currentProxyAdminOwner.toLowerCase() !== from.toLowerCase()) {
-            throw new Error(`from != Proxy Admin Contract's owner`);
-          }
-
           let executeReceipt;
           if (updateMethod) {
             executeReceipt = await execute(
@@ -1079,10 +1222,6 @@ Plus they are only used when the contract is meant to be used as standalone when
             throw new Error(`could not execute ${changeImplementationMethod}`);
           }
         } else {
-          if (currentOwner.toLowerCase() !== from.toLowerCase()) {
-            throw new Error(`from != proxy's admin/owner`);
-          }
-
           let executeReceipt;
           if (
             changeImplementationMethod === 'upgradeToAndCall' &&
@@ -1120,7 +1259,7 @@ Plus they are only used when the contract is meant to be used as standalone when
         execute: updateMethod
           ? {
               methodName: updateMethod,
-              args: argsArray,
+              args: updateArgs,
             }
           : undefined,
       };
@@ -1146,7 +1285,7 @@ Plus they are only used when the contract is meant to be used as standalone when
           execute: updateMethod
             ? {
                 methodName: updateMethod,
-                args: argsArray,
+                args: updateArgs,
               }
             : undefined,
         };
@@ -1178,34 +1317,31 @@ Plus they are only used when the contract is meant to be used as standalone when
     return getFrom(address);
   }
 
-  function getOptionalFrom(
-    from?: string
-  ): {address?: Address; ethersSigner?: Signer; hardwareWallet?: string} {
-    return _getFrom(from, true);
+  function getOptionalFrom(from?: string): {
+    address?: Address;
+    ethersSigner?: Signer;
+    hardwareWallet?: string;
+  } {
+    if (!from) {
+      return {
+        address: from,
+        ethersSigner: undefined,
+        hardwareWallet: undefined,
+      };
+    }
+    return getFrom(from);
   }
 
-  function getFrom(
-    from?: string
-  ): {address: Address; ethersSigner?: Signer; hardwareWallet?: string} {
-    return _getFrom(from, false) as {
-      address: Address;
-      ethersSigner?: Signer;
-      hardwareWallet?: string;
-    };
-  }
-
-  function _getFrom(
-    from?: string,
-    optional?: boolean
-  ): {address?: Address; ethersSigner?: Signer; hardwareWallet?: string} {
+  function getFrom(from: string): {
+    address: Address;
+    ethersSigner: Signer;
+    hardwareWallet?: string;
+    unknown: boolean;
+  } {
     let ethersSigner: Signer | undefined;
     let hardwareWallet: string | undefined = undefined;
-    if (!from) {
-      if (optional) {
-        return {};
-      }
-      throw new Error('no from specified');
-    }
+    let unknown = false;
+
     if (from.length >= 64) {
       if (from.length === 64) {
         from = '0x' + from;
@@ -1238,7 +1374,12 @@ Plus they are only used when the contract is meant to be used as standalone when
       }
     }
 
-    return {address: from, ethersSigner, hardwareWallet};
+    if (!ethersSigner) {
+      unknown = true;
+      ethersSigner = provider.getSigner(from);
+    }
+
+    return {address: from, ethersSigner, hardwareWallet, unknown};
   }
 
   // async function findEvents(contract: Contract, event: string, blockHash: string): Promise<any[]> {
@@ -1261,7 +1402,7 @@ Plus they are only used when the contract is meant to be used as standalone when
     options: DiamondOptions
   ): Promise<DeployResult> {
     const oldDeployment = await getDeploymentOrNUll(name);
-    let proxy;
+    let proxy: Deployment | undefined;
     const deployResult = _checkUpgradeIndex(
       oldDeployment,
       options.upgradeIndex
@@ -1346,6 +1487,8 @@ Plus they are only used when the contract is meant to be used as standalone when
         estimateGasExtra: options.estimateGasExtra,
         estimatedGasLimit: options.estimatedGasLimit,
         gasPrice: options.gasPrice,
+        maxFeePerGas: options.maxFeePerGas,
+        maxPriorityFeePerGas: options.maxPriorityFeePerGas,
         log: options.log,
         // deterministicDeployment: options.deterministicDeployment, // todo ?
         libraries: options.libraries,
@@ -1461,6 +1604,8 @@ Plus they are only used when the contract is meant to be used as standalone when
           estimateGasExtra: options.estimateGasExtra,
           estimatedGasLimit: options.estimatedGasLimit,
           gasPrice: options.gasPrice,
+          maxFeePerGas: options.maxFeePerGas,
+          maxPriorityFeePerGas: options.maxPriorityFeePerGas,
           log: options.log,
         });
         const diamantaireContract = new Contract(
@@ -1674,35 +1819,54 @@ Plus they are only used when the contract is meant to be used as standalone when
   async function rawTx(tx: SimpleTx): Promise<Receipt> {
     tx = {...tx};
     await init();
-    const {address: from, ethersSigner, hardwareWallet} = getFrom(tx.from);
-    if (!ethersSigner) {
+    const {
+      address: from,
+      ethersSigner,
+      hardwareWallet,
+      unknown,
+    } = getFrom(tx.from);
+
+    const transactionData = {
+      to: tx.to,
+      gasLimit: tx.gasLimit,
+      gasPrice: tx.gasPrice ? BigNumber.from(tx.gasPrice) : undefined,
+      maxFeePerGas: tx.maxFeePerGas
+        ? BigNumber.from(tx.maxFeePerGas)
+        : undefined,
+      maxPriorityFeePerGas: tx.maxPriorityFeePerGas
+        ? BigNumber.from(tx.maxPriorityFeePerGas)
+        : undefined,
+      value: tx.value ? BigNumber.from(tx.value) : undefined,
+      nonce: tx.nonce,
+      data: tx.data,
+    };
+
+    await overrideGasLimit(transactionData, tx, (newOverrides) =>
+      ethersSigner.estimateGas(newOverrides)
+    );
+    await setupGasPrice(transactionData);
+    await setupNonce(from, transactionData);
+
+    if (unknown) {
       throw new UnknownSignerError({
         from,
-        to: tx.to,
-        data: tx.data,
-        value: tx.value,
+        ...transactionData,
       });
-    } else {
-      const transactionData = {
-        to: tx.to,
-        gasLimit: tx.gasLimit,
-        gasPrice: tx.gasPrice ? BigNumber.from(tx.gasPrice) : undefined, // TODO cinfig
-        value: tx.value ? BigNumber.from(tx.value) : undefined,
-        nonce: tx.nonce,
-        data: tx.data,
-      };
-      if (hardwareWallet) {
-        log(` please confirm on your ${hardwareWallet}`);
-      }
-      let pendingTx = await ethersSigner.sendTransaction(transactionData);
-      pendingTx = await onPendingTx(pendingTx);
-      if (tx.autoMine) {
-        try {
-          await provider.send('evm_mine', []);
-        } catch (e) {}
-      }
-      return pendingTx.wait();
     }
+
+    if (hardwareWallet) {
+      log(` please confirm on your ${hardwareWallet}`);
+    }
+    let pendingTx = await handleSpecificErrors(
+      ethersSigner.sendTransaction(transactionData)
+    );
+    pendingTx = await onPendingTx(pendingTx);
+    if (tx.autoMine) {
+      try {
+        await provider.send('evm_mine', []);
+      } catch (e) {}
+    }
+    return pendingTx.wait();
   }
 
   async function catchUnknownSigner(
@@ -1754,7 +1918,7 @@ args:
             console.log(
               `
 from: ${from}
-to: ${to}${
+to: ${to ? to : '0x0000000000000000000000000000000000000000'}${
                 value
                   ? '\nvalue: ' +
                     (typeof value === 'string' ? value : value.toString())
@@ -1787,7 +1951,12 @@ data: ${data}
   ): Promise<Receipt> {
     options = {...options}; // ensure no change
     await init();
-    const {address: from, ethersSigner, hardwareWallet} = getFrom(options.from);
+    const {
+      address: from,
+      ethersSigner,
+      hardwareWallet,
+      unknown,
+    } = getFrom(options.from);
 
     let tx;
     const deployment = await partialExtension.get(name);
@@ -1795,37 +1964,42 @@ data: ${data}
     const overrides = {
       gasLimit: options.gasLimit,
       gasPrice: options.gasPrice ? BigNumber.from(options.gasPrice) : undefined, // TODO cinfig
+      maxFeePerGas: options.maxFeePerGas
+        ? BigNumber.from(options.maxFeePerGas)
+        : undefined,
+      maxPriorityFeePerGas: options.maxPriorityFeePerGas
+        ? BigNumber.from(options.maxPriorityFeePerGas)
+        : undefined,
       value: options.value ? BigNumber.from(options.value) : undefined,
       nonce: options.nonce,
     };
 
-    const ethersContract = new Contract(
-      deployment.address,
-      abi,
-      (ethersSigner as Signer) || provider
-    );
+    const ethersContract = new Contract(deployment.address, abi, ethersSigner);
     if (!ethersContract.functions[methodName]) {
       throw new Error(
         `No method named "${methodName}" on contract deployed as "${name}"`
       );
     }
 
-    const numArguments = ethersContract.interface.getFunction(methodName).inputs
-      .length;
+    const numArguments =
+      ethersContract.interface.getFunction(methodName).inputs.length;
     if (args.length !== numArguments) {
       throw new Error(
         `expected ${numArguments} arguments for method "${methodName}", got ${args.length}`
       );
     }
 
-    if (options.log || hardwareWallet) {
-      print(`executing ${name}.${methodName}`);
-      if (hardwareWallet) {
-        print(` (please confirm on your ${hardwareWallet})`);
-      }
-    }
+    await overrideGasLimit(overrides, options, (newOverrides) => {
+      const ethersArgsWithGasLimit = args
+        ? args.concat([newOverrides])
+        : [newOverrides];
+      return ethersContract.estimateGas[methodName](...ethersArgsWithGasLimit);
+    });
+    await setupGasPrice(overrides);
+    await setupNonce(from, overrides);
+    const ethersArgs = args ? args.concat([overrides]) : [overrides];
 
-    if (!ethersSigner) {
+    if (unknown) {
       const ethersArgs = args ? args.concat([overrides]) : [overrides];
       const {data} = await ethersContract.populateTransaction[methodName](
         ...ethersArgs
@@ -1841,19 +2015,19 @@ data: ${data}
           args,
         },
       });
-    } else {
-      await overrideGasLimit(overrides, options, (newOverrides) => {
-        const ethersArgsWithGasLimit = args
-          ? args.concat([newOverrides])
-          : [newOverrides];
-        return ethersContract.estimateGas[methodName](
-          ...ethersArgsWithGasLimit
-        );
-      });
-      await setupGasPrice(overrides);
-      const ethersArgs = args ? args.concat([overrides]) : [overrides];
-      tx = await ethersContract.functions[methodName](...ethersArgs);
     }
+
+    if (options.log || hardwareWallet) {
+      print(`executing ${name}.${methodName}`);
+      if (hardwareWallet) {
+        print(` (please confirm on your ${hardwareWallet})`);
+      }
+    }
+
+    tx = await handleSpecificErrors(
+      ethersContract.functions[methodName](...ethersArgs)
+    );
+
     tx = await onPendingTx(tx);
 
     if (options.log || hardwareWallet) {
@@ -1916,6 +2090,12 @@ data: ${data}
     const overrides: PayableOverrides = {
       gasLimit: options.gasLimit,
       gasPrice: options.gasPrice ? BigNumber.from(options.gasPrice) : undefined, // TODO cinfig
+      maxFeePerGas: options.maxFeePerGas
+        ? BigNumber.from(options.maxFeePerGas)
+        : undefined,
+      maxPriorityFeePerGas: options.maxPriorityFeePerGas
+        ? BigNumber.from(options.maxPriorityFeePerGas)
+        : undefined,
       value: options.value ? BigNumber.from(options.value) : undefined,
       nonce: options.nonce,
     };
@@ -1963,6 +2143,261 @@ data: ${data}
     deterministic,
   };
 
+  const utils = {
+    dealWithPendingTransactions: async (
+      pendingTxs: {
+        [txHash: string]: {
+          name: string;
+          deployment?: any;
+          rawTx: string;
+          decoded: {
+            from: string;
+            gasPrice?: string;
+            maxFeePerGas?: string | BigNumber;
+            maxPriorityFeePerGas?: string | BigNumber;
+            gasLimit: string;
+            to: string;
+            value: string;
+            nonce: number;
+            data: string;
+            r: string;
+            s: string;
+            v: number;
+            // creates: tx.creates, // TODO test
+            chainId: number;
+          };
+        };
+      },
+      pendingTxPath: string,
+      globalGasPrice: string | undefined
+    ) => {
+      await init();
+      const txHashes = Object.keys(pendingTxs);
+      for (const txHash of txHashes) {
+        let tx: Transaction | undefined;
+        const txData = pendingTxs[txHash];
+        if (txData.rawTx || txData.decoded) {
+          if (txData.rawTx) {
+            tx = parseTransaction(txData.rawTx);
+          } else {
+            tx = recode(txData.decoded);
+          }
+          // alternative add options to deploy task to delete pending tx, combined with --gasprice this would work (except for timing edge case)
+        } else {
+          console.error(`no access to raw data for tx ${txHash}`);
+        }
+
+        const txFromPeers = await network.provider.send(
+          'eth_getTransactionByHash',
+          [txHash]
+        );
+
+        let feeHistory:
+          | {
+              baseFeePerGas: string[];
+              gasUsedRatio?: number[]; // not documented on https://playground.open-rpc.org/?schemaUrl=https://raw.githubusercontent.com/ethereum/eth1.0-apis/assembled-spec/openrpc.json&uiSchema%5BappBar%5D%5Bui:splitView%5D=false&uiSchema%5BappBar%5D%5Bui:input%5D=false&uiSchema%5BappBar%5D%5Bui:examplesDropdown%5D=false
+              oldestBlock: number;
+              reward: string[][];
+            }
+          | undefined = undefined;
+        let newGasPriceS = globalGasPrice;
+        if (!newGasPriceS) {
+          newGasPriceS = await network.provider.send('eth_gasPrice', []);
+          try {
+            feeHistory = await network.provider.send('eth_feeHistory', [
+              4,
+              'latest',
+              [25, 75],
+            ]);
+          } catch (e) {}
+        }
+        const newGasPrice = BigNumber.from(newGasPriceS);
+
+        let newBaseFee: BigNumber | undefined = undefined;
+        if (feeHistory) {
+          newBaseFee = BigNumber.from(
+            feeHistory.baseFeePerGas[feeHistory.baseFeePerGas.length - 1]
+          );
+        }
+
+        const choices = ['skip (forget tx)'];
+        if (!txFromPeers) {
+          if (tx) {
+            choices.unshift('broadcast again');
+          }
+          console.log(`transaction ${txHash} cannot be found among peers`);
+        } else {
+          choices.unshift('continue waiting');
+          if (tx) {
+            console.log(
+              `transaction ${txHash} still pending... It used a gas pricing config of ${
+                tx.gasPrice
+                  ? `(gasPrice: ${tx.gasPrice.toString()} wei)`
+                  : tx.maxPriorityFeePerGas || tx.maxPriorityFeePerGas
+                  ? `maxPriorityFeePerGas: ${tx.maxPriorityFeePerGas?.toString()} maxFeePerGas: ${tx.maxFeePerGas?.toString()}`
+                  : ``
+              } ,
+              current gas price is ${newGasPrice.toString()} wei
+              ${newBaseFee ? `new baseFee is ${newBaseFee.toString()}` : ''}
+              `
+            );
+          } else {
+            console.log(`transaction ${txHash} still pending...`);
+          }
+        }
+
+        if (tx && tx.gasPrice && tx.gasPrice.lt(newGasPrice)) {
+          choices.unshift('increase gas');
+        } else if (tx && (tx.maxFeePerGas || tx.maxPriorityFeePerGas)) {
+          // choices.unshift(); // TODO
+          console.log('TODO handle EIP1559 gas pricing increase');
+        }
+
+        const prompt = new (enquirer as any).Select({
+          name: 'action',
+          message: 'Choose what to do with the pending transaction:',
+          choices,
+        });
+
+        const answer = await prompt.run();
+        let txHashToWait: string | undefined;
+        if (answer !== 'skip (forget tx)') {
+          if (answer === 'continue waiting') {
+            console.log('waiting for transaction...');
+            txHashToWait = txHash;
+          } else if (answer === 'broadcast again') {
+            if (!tx) {
+              throw new Error(`cannot resubmit a tx if info not available`);
+            }
+
+            if (txData.rawTx) {
+              const tx = await handleSpecificErrors(
+                provider.sendTransaction(txData.rawTx)
+              );
+              txHashToWait = tx.hash;
+              if (tx.hash !== txHash) {
+                console.error('non mathcing tx hashes after resubmitting...');
+              }
+              console.log('waiting for newly broadcasted tx ...');
+            } else {
+              console.log('resigning the tx...');
+              const {ethersSigner, hardwareWallet} = getOptionalFrom(tx.from);
+              if (!ethersSigner) {
+                throw new Error('no signer for ' + tx.from);
+              }
+
+              if (hardwareWallet) {
+                print(` (please confirm on your ${hardwareWallet})`);
+              }
+
+              const txReq = await handleSpecificErrors(
+                ethersSigner.sendTransaction({
+                  to: tx.to,
+                  from: tx.from,
+                  nonce: tx.nonce,
+
+                  gasLimit: tx.gasLimit,
+                  gasPrice: tx.gasPrice,
+                  maxFeePerGas: tx.maxFeePerGas,
+                  maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
+
+                  data: tx.data,
+                  value: tx.value,
+                  chainId: tx.chainId,
+                  type: tx.type === null ? undefined : tx.type,
+                  accessList: tx.accessList,
+                })
+              );
+              txHashToWait = txReq.hash;
+              if (txReq.hash !== txHash) {
+                delete pendingTxs[txHash];
+                if (Object.keys(pendingTxs).length === 0) {
+                  fs.removeSync(pendingTxPath);
+                } else {
+                  fs.writeFileSync(
+                    pendingTxPath,
+                    JSON.stringify(pendingTxs, null, '  ')
+                  );
+                }
+                await onPendingTx(txReq);
+                console.error('non mathcing tx hashes after resubmitting...');
+              }
+            }
+          } else if (answer === 'increase gas') {
+            if (!tx) {
+              throw new Error(`cannot resubmit a tx if info not available`);
+            }
+            const {ethersSigner, hardwareWallet} = getOptionalFrom(tx.from);
+            if (!ethersSigner) {
+              throw new Error('no signer for ' + tx.from);
+            }
+
+            if (hardwareWallet) {
+              print(` (please confirm on your ${hardwareWallet})`);
+            }
+
+            const txReq = await handleSpecificErrors(
+              ethersSigner.sendTransaction({
+                to: tx.to,
+                from: tx.from,
+                nonce: tx.nonce,
+
+                gasLimit: tx.gasLimit,
+                gasPrice: newGasPrice, // TODO EIP1559
+
+                data: tx.data,
+                value: tx.value,
+                chainId: tx.chainId,
+                type: tx.type === null ? undefined : tx.type,
+                accessList: tx.accessList,
+              })
+            );
+            txHashToWait = txReq.hash;
+            delete pendingTxs[txHash];
+            if (Object.keys(pendingTxs).length === 0) {
+              fs.removeSync(pendingTxPath);
+            } else {
+              fs.writeFileSync(
+                pendingTxPath,
+                JSON.stringify(pendingTxs, null, '  ')
+              );
+            }
+            await onPendingTx(txReq);
+            console.log('new transaction submitted, waiting...');
+          }
+        }
+
+        if (txHashToWait) {
+          const receipt = await waitForTx(
+            network.provider,
+            txHashToWait,
+            false
+          );
+          if (
+            (!receipt.status || receipt.status == 1) && // ensure we do not save failed deployment
+            receipt.contractAddress &&
+            txData.name
+          ) {
+            await saveDeployment(txData.name, {
+              ...txData.deployment,
+              receipt,
+            });
+          }
+        }
+
+        delete pendingTxs[txHash];
+        if (Object.keys(pendingTxs).length === 0) {
+          fs.removeSync(pendingTxPath);
+        } else {
+          fs.writeFileSync(
+            pendingTxPath,
+            JSON.stringify(pendingTxs, null, '  ')
+          );
+        }
+      }
+    },
+  };
+
   // ////////// Backward compatible for transition: //////////////////
   (extension as any).call = (
     options: any,
@@ -1992,20 +2427,18 @@ data: ${data}
   };
 
   (extension as any).deployIfDifferent = (
-    fieldsToCompare: string | string[],
     name: string,
     options: DeployOptions,
     contractName: string,
     ...args: any[]
   ): Promise<DeployResult> => {
-    options.fieldsToCompare = fieldsToCompare;
     options.contract = contractName;
     options.args = args;
     return deploy(name, options);
   };
   // ////////////////////////////////////////////////////////////////////
 
-  return extension;
+  return {extension, utils};
 }
 
 function pause(duration: number): Promise<void> {
